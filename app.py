@@ -87,6 +87,56 @@ def render_trade_builder(ticker: str, strategy: str):
     st.dataframe(trade_df, use_container_width=True, hide_index=True)
 
 
+def _star_rating_from_score(score: int) -> str:
+    if score >= 80:
+        stars = 5
+    elif score >= 60:
+        stars = 4
+    elif score >= 40:
+        stars = 3
+    elif score >= 20:
+        stars = 2
+    else:
+        stars = 1
+    return "★" * stars + "☆" * (5 - stars)
+
+
+def render_trade_of_the_day_card(scan_results: pd.DataFrame):
+    bull_puts = scan_results[scan_results["Strategy"] == "Bull Put Spread"]
+    if bull_puts.empty:
+        st.info("No valid trade today")
+        return
+
+    top_candidate = bull_puts.iloc[0]
+    ticker = top_candidate["Ticker"]
+    score = int(top_candidate["Score"])
+    strategy = top_candidate["Strategy"]
+
+    trade = build_trade(ticker, strategy)
+    if "message" in trade:
+        st.info("No valid trade today")
+        return
+
+    st.markdown("---")
+    st.subheader("Trade of the Day")
+    card_columns = st.columns([1, 1, 1, 1])
+    with card_columns[0]:
+        st.markdown(f"**Ticker**\n{ticker}")
+        st.markdown(f"**Strategy**\n{strategy}")
+        st.markdown(f"**Expiration**\n{trade.get('expiration', 'N/A')}")
+    with card_columns[1]:
+        st.markdown(f"**Short Strike**\n{trade.get('short_strike', 'N/A')}")
+        st.markdown(f"**Long Strike**\n{trade.get('long_strike', 'N/A')}")
+    with card_columns[2]:
+        st.markdown(f"**Estimated Credit**\n${trade.get('estimated_credit', 'N/A')}")
+        st.markdown(f"**Max Risk**\n${trade.get('max_risk', 'N/A')}")
+    with card_columns[3]:
+        return_on_risk = trade.get('return_on_risk')
+        return_on_risk_text = f"{return_on_risk:.2f}" if isinstance(return_on_risk, (int, float)) else "N/A"
+        st.markdown(f"**Return on Risk**\n{return_on_risk_text}")
+        st.markdown(f"**Rating**\n{_star_rating_from_score(score)}")
+
+
 @st.cache_data(ttl=300)
 def load_dashboard_data():
     market_data = download_watchlist_data(TICKERS)
@@ -114,6 +164,8 @@ market_data, scan_results = load_dashboard_data()
 if scan_results.empty:
     st.error("No market data was loaded. Check your internet connection and try again.")
     st.stop()
+
+render_trade_of_the_day_card(scan_results)
 
 st.subheader("Watchlist scorecard")
 
