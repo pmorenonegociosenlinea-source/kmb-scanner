@@ -63,6 +63,56 @@ def _get_expirations_from_ticker(stock) -> List[str]:
     return expirations
 
 
+def debug_expirations_for_ticker(ticker: str) -> Dict[str, object]:
+    """Return raw diagnostics about how expirations are retrieved for a ticker.
+
+    Does NOT change any trading logic. Intended for debugging only.
+    """
+    out: Dict[str, object] = {"ticker": ticker, "requested_symbol": None, "raw_options": None, "callable": False, "exception": None}
+    try:
+        stock = yf.Ticker(ticker)
+        # record what symbol yfinance Ticker reports if available
+        try:
+            out["requested_symbol"] = getattr(stock, "ticker", None)
+        except Exception:
+            out["requested_symbol"] = None
+
+        raw = None
+        try:
+            raw = getattr(stock, "options", None)
+            out["raw_options_repr"] = repr(raw)
+        except Exception as e:
+            out["exception"] = f"getting attribute options: {e!r}"
+            return out
+
+        # If callable, attempt to call (some versions may expose as callable)
+        if callable(raw):
+            out["callable"] = True
+            try:
+                called = raw()
+                out["raw_options_after_call_repr"] = repr(called)
+                # try to coerce to list
+                try:
+                    out["raw_options_list"] = [str(x) for x in list(called)]
+                except Exception:
+                    out["raw_options_list"] = None
+            except Exception as e:
+                out["exception"] = f"calling options callable: {e!r}"
+                return out
+        else:
+            # not callable; try to iterate or coerce
+            try:
+                out["raw_options_list"] = [str(x) for x in list(raw) if x is not None]
+            except Exception as e:
+                out["exception"] = f"iterating options: {e!r}"
+                out["raw_options_list"] = None
+
+        return out
+    except Exception as exc:
+        out["exception"] = f"unexpected: {exc!r}"
+        return out
+
+
 def _current_price_from_yfinance(ticker: str) -> Optional[float]:
     try:
         stock = yf.Ticker(ticker)
@@ -432,6 +482,10 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
             return result
 
         # Evaluate each expiration and collect per-expiration diagnostics
+        # determine a selected expiration for quick reference and keep per-expiration details
+        selected_expiration = _select_expiration(expirations)
+        result["expiration"] = selected_expiration
+
         per_expirations: List[Dict[str, object]] = []
         for exp in expirations:
             exp_entry: Dict[str, object] = {"expiration": exp, "candidates": []}
