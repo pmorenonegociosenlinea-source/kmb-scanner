@@ -102,6 +102,13 @@ def _render_bull_put_diagnostics(scan_results: pd.DataFrame):
         st.markdown(f"**{ticker}**")
         expiration = diag.get("expiration") or "N/A"
         st.markdown(f"Expiration: {expiration}")
+        # Show all available expirations returned by yfinance, if any
+        avail = diag.get("available_expirations")
+        if avail:
+            expirations_text = ", ".join(str(x) for x in avail)
+            st.markdown(f"Available expirations: {expirations_text}")
+        else:
+            st.markdown("Available expirations: No expirations returned by yfinance")
         candidates = diag.get("candidates", [])
         if not candidates:
             st.markdown("No candidates found for this ticker.")
