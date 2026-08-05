@@ -28,6 +28,41 @@ def _select_expiration(expirations: List[str]) -> Optional[str]:
     return min(expirations_sorted, key=_distance)
 
 
+def _get_expirations_from_ticker(stock) -> List[str]:
+    """Robustly extract expiration dates from a yfinance Ticker-like object.
+
+    Handles properties that may be lists, Index objects, callables, or other iterables.
+    Returns a list of string dates (may be empty).
+    """
+    expirations = []
+    try:
+        raw = getattr(stock, "options", None)
+        if raw is None:
+            return []
+
+        # If attribute is callable (rare), call it
+        if callable(raw):
+            try:
+                raw = raw()
+            except Exception:
+                return []
+
+        # If it's a pandas Index or numpy array-like, iterate
+        try:
+            # Some yfinance versions return an Index object
+            expirations = [str(x) for x in list(raw) if x is not None]
+        except Exception:
+            # Fallback: single string
+            if isinstance(raw, str):
+                expirations = [raw]
+            else:
+                expirations = []
+    except Exception:
+        return []
+
+    return expirations
+
+
 def _current_price_from_yfinance(ticker: str) -> Optional[float]:
     try:
         stock = yf.Ticker(ticker)
@@ -301,7 +336,7 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
 
     try:
         stock = yf.Ticker(ticker)
-        expirations = list(getattr(stock, "options", []) or [])
+        expirations = _get_expirations_from_ticker(stock)
         if not expirations:
             raise ValueError(f"No option expirations available for {ticker}")
 
@@ -373,7 +408,8 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
 
     try:
         stock = yf.Ticker(ticker)
-        expirations = list(getattr(stock, "options", []) or [])
+        expirations = _get_expirations_from_ticker(stock)
+        result["available_expirations"] = expirations
         if not expirations:
             return result
 
