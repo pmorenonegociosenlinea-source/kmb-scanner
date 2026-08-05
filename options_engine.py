@@ -220,6 +220,10 @@ def _build_bull_put_spread_candidates(
         if not (0.15 <= abs(estimated_short_delta) <= 0.20):
             continue
 
+        # Require minimum estimated credit
+        if metrics["estimated_credit"] < 0.90:
+            continue
+
         # Extract IV Rank if present; fall back to 0.0
         iv_rank_raw = (
             short_row.get("ivRank")
@@ -245,13 +249,12 @@ def _build_bull_put_spread_candidates(
             }
         )
 
-    # Rank by: 1) Highest IV Rank, 2) Highest estimated credit, 3) Highest probability of profit
+    # Rank by: 1) Highest return on risk, 2) Highest estimated credit, 3) Highest probability of profit
     candidates.sort(
         key=lambda item: (
-            -float(item.get("iv_rank", 0.0)),
-            -float(item["estimated_credit"]),
+            -float(item.get("return_on_risk", 0.0)),
+            -float(item.get("estimated_credit", 0.0)),
             -float(item.get("probability_of_profit") or 0.0),
-            float(item["short_strike"]),
         )
     )
     return candidates
@@ -340,27 +343,42 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
         if not expirations:
             raise ValueError(f"No option expirations available for {ticker}")
 
-        selected_expiration = _select_expiration(expirations)
-        if selected_expiration is None:
-            raise ValueError(f"No suitable expiration available for {ticker}")
+        # Evaluate all expirations and collect candidates across them
+        all_candidates: List[Dict[str, object]] = []
+        current_price = _current_price_from_yfinance(ticker)
+        for exp in expirations:
+            try:
+                chain_data = stock.option_chain(exp)
+            except Exception:
+                continue
+            calls_df, puts_df = _normalize_option_chain_payload(chain_data)
+            if puts_df is None or puts_df is None:
+                continue
 
-        chain_data = stock.option_chain(selected_expiration)
-        calls_df, puts_df = _normalize_option_chain_payload(chain_data)
-        if calls_df is None or puts_df is None:
-            raise ValueError(f"Option-chain data missing for {ticker}")
-
-        if strategy == "Bull Put Spread":
-            current_price = _current_price_from_yfinance(ticker)
             candidates = _build_bull_put_spread_candidates(
-                puts_df, ticker=ticker, expiration=selected_expiration, current_price=current_price
+                puts_df, ticker=ticker, expiration=exp, current_price=current_price
             )
-            if not candidates:
+            for c in candidates:
+                c["expiration"] = exp
+            all_candidates.extend(candidates)
+
+        # After evaluating all expirations, apply final ranking and pick best
+        if strategy == "Bull Put Spread":
+            if not all_candidates:
                 raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
-            best = candidates[0]
+            # Already sorted within each call; sort final list by required ranking
+            all_candidates.sort(
+                key=lambda item: (
+                    -float(item.get("return_on_risk", 0.0)),
+                    -float(item.get("estimated_credit", 0.0)),
+                    -float(item.get("probability_of_profit") or 0.0),
+                )
+            )
+            best = all_candidates[0]
             return {
                 "ticker": ticker,
                 "strategy": strategy,
-                "expiration": selected_expiration,
+                "expiration": best.get("expiration"),
                 "short_strike": best["short_strike"],
                 "long_strike": best["long_strike"],
                 "width": best["width"],
@@ -413,90 +431,97 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
         if not expirations:
             return result
 
-        selected_expiration = _select_expiration(expirations)
-        result["expiration"] = selected_expiration
-        if selected_expiration is None:
-            return result
-
-        chain_data = stock.option_chain(selected_expiration)
-        calls_df, puts_df = _normalize_option_chain_payload(chain_data)
-        if puts_df is None or puts_df.empty:
-            return result
-
-        prepared = puts_df.copy()
-        prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
-        prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
-
-        for index, short_row in prepared.iterrows():
-            short_strike = float(short_row["strike"])
-            long_strike = short_strike - 5.0
-            long_row = prepared[prepared["strike"] == long_strike]
-            width = short_strike - long_strike
-
-            candidate: Dict[str, object] = {
-                "short_strike": round(short_strike, 2),
-                "long_strike": round(long_strike, 2) if not long_row.empty else None,
-                "width": round(width, 2),
-                "estimated_credit": None,
-                "short_delta": None,
-                "accepted": False,
-                "rejection_reasons": [],
-            }
-
-            if long_row.empty:
-                candidate["rejection_reasons"].append("no matching 5-width long strike")
-                result["candidates"].append(candidate)
+        # Evaluate each expiration and collect per-expiration diagnostics
+        per_expirations: List[Dict[str, object]] = []
+        for exp in expirations:
+            exp_entry: Dict[str, object] = {"expiration": exp, "candidates": []}
+            try:
+                chain_data = stock.option_chain(exp)
+            except Exception:
+                exp_entry["error"] = "unable to retrieve option chain"
+                per_expirations.append(exp_entry)
                 continue
 
-            metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
-            candidate["estimated_credit"] = metrics.get("estimated_credit")
+            calls_df, puts_df = _normalize_option_chain_payload(chain_data)
+            if puts_df is None or puts_df.empty:
+                exp_entry["error"] = "no puts data for expiration"
+                per_expirations.append(exp_entry)
+                continue
 
-            # Estimate short delta using current price, implied vol and DTE
-            cp = _current_price_from_yfinance(ticker) or short_strike
-            dte = 45
-            if result.get("expiration"):
+            prepared = puts_df.copy()
+            prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
+            prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
+
+            for index, short_row in prepared.iterrows():
+                short_strike = float(short_row["strike"])
+                long_strike = short_strike - 5.0
+                long_row = prepared[prepared["strike"] == long_strike]
+                width = short_strike - long_strike
+
+                candidate: Dict[str, object] = {
+                    "short_strike": round(short_strike, 2),
+                    "long_strike": round(long_strike, 2) if not long_row.empty else None,
+                    "width": round(width, 2),
+                    "estimated_credit": None,
+                    "estimated_short_delta": None,
+                    "accepted": False,
+                    "rejection_reasons": [],
+                }
+
+                if long_row.empty:
+                    candidate["rejection_reasons"].append("no matching 5-width long strike")
+                    exp_entry["candidates"].append(candidate)
+                    continue
+
+                metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
+                candidate["estimated_credit"] = metrics.get("estimated_credit")
+
+                # Estimate short delta using current price, implied vol and DTE
+                cp = _current_price_from_yfinance(ticker) or short_strike
                 try:
-                    dte = _days_to_expiration(pd.Timestamp(result.get("expiration")))
+                    dte = _days_to_expiration(pd.Timestamp(exp))
                 except Exception:
                     dte = 45
 
-            iv_raw = (
-                short_row.get("impliedVolatility")
-                or short_row.get("implied_volatility")
-                or short_row.get("iv")
-                or short_row.get("ivRank")
-                or short_row.get("iv_rank")
-                or 0.0
-            )
-            try:
-                iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
-            except Exception:
-                iv_val = 0.0
-
-            if 0.0 <= iv_val <= 1.0:
-                implied_vol = 0.2 + iv_val * 0.4
-            else:
-                implied_vol = iv_val
-
-            est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
-            candidate["estimated_short_delta"] = est_delta
-            if not (0.15 <= abs(est_delta) <= 0.20):
-                candidate["rejection_reasons"].append(
-                    f"estimated short delta = {est_delta:.2f} (expected 0.15-0.20)"
+                iv_raw = (
+                    short_row.get("impliedVolatility")
+                    or short_row.get("implied_volatility")
+                    or short_row.get("iv")
+                    or short_row.get("ivRank")
+                    or short_row.get("iv_rank")
+                    or 0.0
                 )
+                try:
+                    iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
+                except Exception:
+                    iv_val = 0.0
 
-            # Estimated credit check - informative; still included as a potential rejection reason
-            if candidate.get("estimated_credit") is None or candidate.get("estimated_credit", 0.0) <= 0.0:
-                candidate["rejection_reasons"].append("insufficient estimated credit")
-            elif candidate.get("estimated_credit", 0.0) < 0.9:
-                candidate["rejection_reasons"].append("estimated credit too low")
+                if 0.0 <= iv_val <= 1.0:
+                    implied_vol = 0.2 + iv_val * 0.4
+                else:
+                    implied_vol = iv_val
 
-            # Acceptance: must have matching long strike and short delta in required range
-            if not candidate["rejection_reasons"]:
-                candidate["accepted"] = True
+                est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
+                candidate["estimated_short_delta"] = est_delta
+                if not (0.15 <= abs(est_delta) <= 0.20):
+                    candidate["rejection_reasons"].append(
+                        f"estimated short delta = {est_delta:.2f} (expected 0.15-0.20)"
+                    )
 
-            result["candidates"].append(candidate)
+                # Estimated credit check
+                if candidate.get("estimated_credit") is None or candidate.get("estimated_credit", 0.0) <= 0.0:
+                    candidate["rejection_reasons"].append("insufficient estimated credit")
+                elif candidate.get("estimated_credit", 0.0) < 0.9:
+                    candidate["rejection_reasons"].append("estimated credit too low")
 
+                if not candidate["rejection_reasons"]:
+                    candidate["accepted"] = True
+
+                exp_entry["candidates"].append(candidate)
+
+            per_expirations.append(exp_entry)
+
+        result["per_expirations"] = per_expirations
         return result
     except Exception:
         return result
