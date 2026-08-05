@@ -104,10 +104,19 @@ def _build_bull_put_spread_candidates(puts_df: pd.DataFrame) -> List[Dict[str, f
         short_delta_value = float(short_delta)
         if not (0.15 <= abs(short_delta_value) <= 0.20):
             continue
-        if metrics["estimated_credit"] < 0.90:
-            continue
-        if metrics["return_on_risk"] <= 0.25:
-            continue
+
+        # Extract IV Rank if present; fall back to implied volatility or 0.0
+        iv_rank_raw = (
+            short_row.get("ivRank")
+            or short_row.get("iv_rank")
+            or short_row.get("impliedVolatility")
+            or short_row.get("implied_volatility")
+            or 0.0
+        )
+        try:
+            iv_rank_value = float(pd.to_numeric(iv_rank_raw, errors="coerce") or 0.0)
+        except Exception:
+            iv_rank_value = 0.0
 
         candidates.append(
             {
@@ -119,13 +128,16 @@ def _build_bull_put_spread_candidates(puts_df: pd.DataFrame) -> List[Dict[str, f
                 "return_on_risk": metrics["return_on_risk"],
                 "short_delta": float(short_delta_value),
                 "probability_of_profit": metrics["probability_of_profit"],
+                "iv_rank": iv_rank_value,
             }
         )
 
+    # Rank by: 1) Highest IV Rank, 2) Highest estimated credit, 3) Highest probability of profit
     candidates.sort(
         key=lambda item: (
-            -float(item["return_on_risk"]),
+            -float(item.get("iv_rank", 0.0)),
             -float(item["estimated_credit"]),
+            -float(item.get("probability_of_profit") or 0.0),
             float(item["short_strike"]),
         )
     )
@@ -202,11 +214,11 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
     if not ticker:
         raise ValueError("Ticker is required")
 
-    if strategy not in {"Bull Put Spread", "Bear Call Spread"}:
+    if strategy != "Bull Put Spread":
         return {
             "ticker": ticker,
             "strategy": strategy,
-            "message": "Unsupported strategy.",
+            "message": "Unsupported strategy. Only Bull Put Spread is supported.",
         }
 
     try:
