@@ -4,6 +4,7 @@ import streamlit as st
 from data import TICKERS, download_watchlist_data, prepare_scan_results
 from indicators import compute_indicator_metrics, make_price_chart, make_rsi_chart, make_volume_chart
 from options_engine import build_trade
+from options_engine import diagnose_bull_put_candidates
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -87,6 +88,46 @@ def render_trade_builder(ticker: str, strategy: str):
     st.dataframe(trade_df, use_container_width=True, hide_index=True)
 
 
+def _render_bull_put_diagnostics(scan_results: pd.DataFrame):
+    bull_puts = scan_results[scan_results["Strategy"] == "Bull Put Spread"]
+    if bull_puts.empty:
+        st.markdown("**Diagnostics**\nNo tickers with Bull Put Spread strategy to diagnose.")
+        return
+
+    st.markdown("---")
+    st.subheader("Diagnostics: Bull Put Candidates")
+    for _, row in bull_puts.iterrows():
+        ticker = row["Ticker"]
+        diag = diagnose_bull_put_candidates(ticker)
+        st.markdown(f"**{ticker}**")
+        expiration = diag.get("expiration") or "N/A"
+        st.markdown(f"Expiration: {expiration}")
+        candidates = diag.get("candidates", [])
+        if not candidates:
+            st.markdown("No candidates found for this ticker.")
+            continue
+
+        for c in candidates:
+            short = c.get("short_strike")
+            delta = c.get("short_delta")
+            credit = c.get("estimated_credit")
+            width = c.get("width")
+            accepted = c.get("accepted")
+            reasons = c.get("rejection_reasons") or []
+
+            if accepted:
+                st.markdown(f"- {short}: Accepted")
+            else:
+                if reasons:
+                    reason_text = ", ".join(reasons)
+                else:
+                    reason_text = "Rejected"
+                detail = f"- {short}: Rejected: {reason_text}"
+                if delta is not None:
+                    detail += f" (short delta = {delta:.2f})"
+                st.markdown(detail)
+
+
 def _star_rating_from_score(score: int) -> str:
     if score >= 80:
         stars = 5
@@ -105,6 +146,8 @@ def render_trade_of_the_day_card(scan_results: pd.DataFrame):
     bull_puts = scan_results[scan_results["Strategy"] == "Bull Put Spread"]
     if bull_puts.empty:
         st.info("No valid trade today")
+        # Show diagnostics for all tickers that have strategy Bull Put Spread in the scan
+        _render_bull_put_diagnostics(scan_results)
         return
 
     top_candidate = bull_puts.iloc[0]
@@ -115,6 +158,8 @@ def render_trade_of_the_day_card(scan_results: pd.DataFrame):
     trade = build_trade(ticker, strategy)
     if "message" in trade:
         st.info("No valid trade today")
+        # Diagnostics for all bull put tickers
+        _render_bull_put_diagnostics(scan_results)
         return
 
     st.markdown("---")

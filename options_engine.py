@@ -278,3 +278,85 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
             "strategy": strategy,
             "message": f"Unable to build live options spread: {exc}",
         }
+
+
+def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
+    """Return diagnostic information for all 5-width bull put candidates for a ticker.
+
+    The returned dict contains the selected expiration and a list of candidate dicts with
+    acceptance status and rejection reasons.
+    """
+    result: Dict[str, object] = {"ticker": ticker, "expiration": None, "candidates": []}
+    if not ticker:
+        return result
+
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = list(getattr(stock, "options", []) or [])
+        if not expirations:
+            return result
+
+        selected_expiration = _select_expiration(expirations)
+        result["expiration"] = selected_expiration
+        if selected_expiration is None:
+            return result
+
+        chain_data = stock.option_chain(selected_expiration)
+        calls_df, puts_df = _normalize_option_chain_payload(chain_data)
+        if puts_df is None or puts_df.empty:
+            return result
+
+        prepared = puts_df.copy()
+        prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
+        prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
+
+        for index, short_row in prepared.iterrows():
+            short_strike = float(short_row["strike"])
+            long_strike = short_strike - 5.0
+            long_row = prepared[prepared["strike"] == long_strike]
+            width = short_strike - long_strike
+
+            candidate: Dict[str, object] = {
+                "short_strike": round(short_strike, 2),
+                "long_strike": round(long_strike, 2) if not long_row.empty else None,
+                "width": round(width, 2),
+                "estimated_credit": None,
+                "short_delta": None,
+                "accepted": False,
+                "rejection_reasons": [],
+            }
+
+            if long_row.empty:
+                candidate["rejection_reasons"].append("no matching 5-width long strike")
+                result["candidates"].append(candidate)
+                continue
+
+            metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
+            candidate["estimated_credit"] = metrics.get("estimated_credit")
+
+            short_delta = pd.to_numeric(short_row.get("delta"), errors="coerce")
+            if pd.isna(short_delta):
+                candidate["rejection_reasons"].append("missing short delta")
+            else:
+                short_delta_value = float(short_delta)
+                candidate["short_delta"] = short_delta_value
+                if not (0.15 <= abs(short_delta_value) <= 0.20):
+                    candidate["rejection_reasons"].append(
+                        f"short delta = {short_delta_value:.2f} (expected 0.15-0.20)"
+                    )
+
+            # Estimated credit check - informative; still included as a potential rejection reason
+            if candidate.get("estimated_credit") is None or candidate.get("estimated_credit", 0.0) <= 0.0:
+                candidate["rejection_reasons"].append("insufficient estimated credit")
+            elif candidate.get("estimated_credit", 0.0) < 0.9:
+                candidate["rejection_reasons"].append("estimated credit too low")
+
+            # Acceptance: must have matching long strike and short delta in required range
+            if not candidate["rejection_reasons"]:
+                candidate["accepted"] = True
+
+            result["candidates"].append(candidate)
+
+        return result
+    except Exception:
+        return result
