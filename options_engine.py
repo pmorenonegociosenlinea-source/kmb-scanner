@@ -529,6 +529,8 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
 
                 metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
                 candidate["estimated_credit"] = metrics.get("estimated_credit")
+                candidate["return_on_risk"] = metrics.get("return_on_risk")
+                candidate["probability_of_profit"] = metrics.get("probability_of_profit")
 
                 # Estimate short delta using current price, implied vol and DTE
                 cp = _current_price_from_yfinance(ticker) or short_strike
@@ -557,18 +559,28 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
 
                 est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
                 candidate["estimated_short_delta"] = est_delta
-                if not (0.15 <= abs(est_delta) <= 0.20):
-                    candidate["rejection_reasons"].append(
-                        f"estimated short delta = {est_delta:.2f} (expected 0.15-0.20)"
-                    )
+                # Delta rejection categorization
+                if abs(est_delta) < 0.15:
+                    candidate["rejection_reasons"].append("delta too low")
+                elif abs(est_delta) > 0.20:
+                    candidate["rejection_reasons"].append("delta too high")
 
                 # Estimated credit check
-                if candidate.get("estimated_credit") is None or candidate.get("estimated_credit", 0.0) <= 0.0:
+                credit_val = candidate.get("estimated_credit") or 0.0
+                if credit_val <= 0.0:
                     candidate["rejection_reasons"].append("insufficient estimated credit")
-                elif candidate.get("estimated_credit", 0.0) < 0.9:
-                    candidate["rejection_reasons"].append("estimated credit too low")
+                elif credit_val < 0.9:
+                    candidate["rejection_reasons"].append("credit too low")
 
-                if not candidate["rejection_reasons"]:
+                # Return-on-risk informational note (not used to reject candidates)
+                ror = candidate.get("return_on_risk") or 0.0
+                if ror < 0.25:
+                    candidate["rejection_reasons"].append("return on risk too low")
+
+                # Acceptance: must have matching long strike and pass delta+credit thresholds
+                # We treat 'return on risk too low' as informational only
+                hard_reasons = [r for r in candidate["rejection_reasons"] if r not in {"return on risk too low"}]
+                if not hard_reasons:
                     candidate["accepted"] = True
 
                 exp_entry["candidates"].append(candidate)
