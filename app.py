@@ -134,6 +134,35 @@ def _render_bull_put_diagnostics(scan_results: pd.DataFrame):
                     detail += f" (short delta = {delta:.2f})"
                 st.markdown(detail)
 
+        # If there is a selected expiration, show a detailed debug table for every strike evaluated
+        sel_exp = diag.get("expiration")
+        if sel_exp:
+            # find per_expirations entry
+            per = diag.get("per_expirations") or []
+            sel_entry = next((e for e in per if e.get("expiration") == sel_exp), None)
+            if sel_entry:
+                rows = []
+                for c in sel_entry.get("candidates", []):
+                    status = "Accepted" if c.get("accepted") else "Rejected"
+                    reasons = c.get("rejection_reasons") or []
+                    rows.append(
+                        {
+                            "Strike": c.get("short_strike"),
+                            "Bid": c.get("raw_bid"),
+                            "Ask": c.get("raw_ask"),
+                            "Mid Price": c.get("mid_price"),
+                            "Delta": c.get("estimated_short_delta") if c.get("estimated_short_delta") is not None else c.get("raw_delta"),
+                            "Estimated Credit": c.get("estimated_credit"),
+                            "Return on Risk": c.get("return_on_risk"),
+                            "Status": status,
+                            "Rejection Reason": ", ".join(reasons) if reasons else "",
+                        }
+                    )
+                if rows:
+                    df_debug = pd.DataFrame(rows)
+                    st.markdown("**Debug: evaluated strikes for selected expiration**")
+                    st.dataframe(df_debug, use_container_width=True)
+
 
 def _star_rating_from_score(score: int) -> str:
     if score >= 80:

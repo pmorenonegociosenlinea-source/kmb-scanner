@@ -518,6 +518,10 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
                     "width": round(width, 2),
                     "estimated_credit": None,
                     "estimated_short_delta": None,
+                    "raw_bid": None,
+                    "raw_ask": None,
+                    "mid_price": None,
+                    "raw_delta": None,
                     "accepted": False,
                     "rejection_reasons": [],
                 }
@@ -526,11 +530,31 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
                     candidate["rejection_reasons"].append("no matching 5-width long strike")
                     exp_entry["candidates"].append(candidate)
                     continue
-
                 metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
                 candidate["estimated_credit"] = metrics.get("estimated_credit")
                 candidate["return_on_risk"] = metrics.get("return_on_risk")
                 candidate["probability_of_profit"] = metrics.get("probability_of_profit")
+
+                # Raw market fields
+                try:
+                    bid_val = pd.to_numeric(short_row.get("bid"), errors="coerce")
+                except Exception:
+                    bid_val = None
+                try:
+                    ask_val = pd.to_numeric(short_row.get("ask"), errors="coerce")
+                except Exception:
+                    ask_val = None
+                candidate["raw_bid"] = float(bid_val) if pd.notna(bid_val) else None
+                candidate["raw_ask"] = float(ask_val) if pd.notna(ask_val) else None
+                try:
+                    candidate["mid_price"] = float(_price_midpoint(short_row))
+                except Exception:
+                    candidate["mid_price"] = None
+                try:
+                    raw_delta_val = pd.to_numeric(short_row.get("delta"), errors="coerce")
+                    candidate["raw_delta"] = float(raw_delta_val) if pd.notna(raw_delta_val) else None
+                except Exception:
+                    candidate["raw_delta"] = None
 
                 # Estimate short delta using current price, implied vol and DTE
                 cp = _current_price_from_yfinance(ticker) or short_strike
