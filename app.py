@@ -231,7 +231,10 @@ def render_trade_of_the_day_card(scan_results: pd.DataFrame):
         st.markdown(f"**Max Risk**\n${trade.get('max_risk', 'N/A')}")
     with card_columns[3]:
         return_on_risk = trade.get('return_on_risk')
-        return_on_risk_text = f"{return_on_risk:.2f}" if isinstance(return_on_risk, (int, float)) else "N/A"
+        if isinstance(return_on_risk, (int, float)):
+            return_on_risk_text = f"{return_on_risk * 100:.1f}%"
+        else:
+            return_on_risk_text = "N/A"
         st.markdown(f"**Return on Risk**\n{return_on_risk_text}")
         st.markdown(f"**Rating**\n{_star_rating_from_score(score)}")
 
