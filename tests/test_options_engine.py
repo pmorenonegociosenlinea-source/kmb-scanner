@@ -4,7 +4,7 @@ from unittest import mock
 
 import pandas as pd
 
-from options_engine import _build_bull_put_spread_candidates, build_trade
+from options_engine import _build_bull_put_spread_candidates, build_trade, diagnose_bull_put_candidates
 
 
 class BullPutSpreadSelectionTests(unittest.TestCase):
@@ -94,6 +94,20 @@ class BullPutSpreadSelectionTests(unittest.TestCase):
         else:
             self.assertIn("message", trade)
             self.assertIn("No valid Bull Put Spread candidates", trade["message"])
+
+    def test_diagnose_always_populates_expiration_fields(self):
+        with mock.patch("options_engine.yf.Ticker") as mock_ticker:
+            mock_ticker.return_value.options = []
+            mock_ticker.return_value.option_chain.side_effect = Exception("no chain")
+
+            diag = diagnose_bull_put_candidates("AAPL")
+
+        self.assertEqual(diag["ticker"], "AAPL")
+        self.assertIsInstance(diag.get("available_expirations"), list)
+        self.assertIsInstance(diag.get("per_expirations"), list)
+        self.assertIn("expiration", diag)
+        self.assertEqual(diag.get("available_expirations"), [])
+        self.assertEqual(diag.get("per_expirations"), [])
 
     def test_build_trade_only_evaluates_selected_expiration(self):
         selected_puts = pd.DataFrame(

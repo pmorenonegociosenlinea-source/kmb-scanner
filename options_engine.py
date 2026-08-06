@@ -247,125 +247,148 @@ def _get_option_short_delta(
     return _estimate_put_delta(cp, strike, implied_vol, dte)
 
 
-def _build_bull_put_spread_candidates(
+def _evaluate_bull_put_spreads(
     puts_df: pd.DataFrame,
     ticker: Optional[str] = None,
     expiration: Optional[str] = None,
     current_price: Optional[float] = None,
-) -> List[Dict[str, float]]:
+) -> List[Dict[str, object]]:
     if puts_df is None or puts_df.empty:
         return []
 
     prepared = puts_df.copy()
     prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
     prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
-
     if prepared.empty:
         return []
 
-    candidates: List[Dict[str, float]] = []
-    for index, short_row in prepared.iterrows():
+    candidates: List[Dict[str, object]] = []
+    for _, short_row in prepared.iterrows():
         short_strike = float(short_row["strike"])
-        long_strike = short_strike - 5.0
-        long_row = prepared[prepared["strike"] == long_strike]
-        if long_row.empty:
-            continue
-        width = short_strike - long_strike
-        metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
+        long_strike = round(short_strike - 5.0, 2)
+        long_rows = prepared[prepared["strike"] == long_strike]
 
-        short_delta = _get_option_short_delta(
-            short_row,
-            ticker=ticker,
-            expiration=expiration,
-            current_price=current_price,
-        )
+        short_bid = pd.to_numeric(short_row.get("bid"), errors="coerce")
+        long_ask = pd.to_numeric(long_rows.iloc[0].get("ask"), errors="coerce") if not long_rows.empty else None
+        long_delta = None
+        if not long_rows.empty:
+            try:
+                long_delta_val = pd.to_numeric(long_rows.iloc[0].get("delta"), errors="coerce")
+                long_delta = float(long_delta_val) if pd.notna(long_delta_val) else None
+            except Exception:
+                long_delta = None
 
-        if not (0.15 <= abs(short_delta) <= 0.20):
-            continue
-
-        # Require minimum estimated credit
-        if metrics["estimated_credit"] < 0.90:
-            continue
-
-        # Extract IV Rank if present; fall back to 0.0
         iv_rank_raw = (
             short_row.get("ivRank")
             or short_row.get("iv_rank")
             or 0.0
         )
         try:
-            iv_rank_value = float(pd.to_numeric(iv_rank_raw, errors="coerce") or 0.0)
+            iv_rank_val = float(pd.to_numeric(iv_rank_raw, errors="coerce") or 0.0)
         except Exception:
-            iv_rank_value = 0.0
+            iv_rank_val = 0.0
 
-        candidates.append(
-            {
-                "short_strike": round(short_strike, 2),
-                "long_strike": round(long_strike, 2),
-                "width": round(width, 2),
-                "estimated_credit": metrics["estimated_credit"],
-                "max_risk": metrics["max_risk"],
-                "return_on_risk": metrics["return_on_risk"],
-                "short_delta": float(short_delta),
-                "probability_of_profit": metrics["probability_of_profit"],
-                "iv_rank": iv_rank_value,
-            }
+        estimated_credit = 0.0
+        if pd.notna(short_bid) and pd.notna(long_ask):
+            estimated_credit = float(short_bid - long_ask)
+
+        max_risk = 5.0 - estimated_credit
+        return_on_risk = float(estimated_credit / max_risk) if max_risk > 0.0 else 0.0
+
+        raw_delta_val = pd.to_numeric(short_row.get("delta"), errors="coerce")
+        if pd.notna(raw_delta_val):
+            short_delta = float(raw_delta_val)
+            estimated_short_delta = None
+        else:
+            short_delta = _get_option_short_delta(
+                short_row,
+                ticker=ticker,
+                expiration=expiration,
+                current_price=current_price,
+            )
+            estimated_short_delta = float(short_delta)
+
+        candidate: Dict[str, object] = {
+            "expiration": expiration,
+            "short_strike": round(short_strike, 2),
+            "long_strike": long_strike if not long_rows.empty else None,
+            "short_bid": float(short_bid) if pd.notna(short_bid) else None,
+            "long_ask": float(long_ask) if pd.notna(long_ask) else None,
+            "estimated_credit": round(estimated_credit, 2),
+            "max_risk": round(max_risk, 2),
+            "return_on_risk": return_on_risk,
+            "short_delta": float(short_delta),
+            "estimated_short_delta": estimated_short_delta,
+            "long_delta": long_delta,
+            "iv_rank": iv_rank_val,
+            "accepted": False,
+            "rejection_reasons": [],
+        }
+
+        if long_rows.empty:
+            candidate["rejection_reasons"].append("no matching 5-width long strike")
+        if candidate["short_bid"] is None or candidate["long_ask"] is None:
+            candidate["rejection_reasons"].append("missing short bid or long ask")
+        if candidate["estimated_credit"] <= 0.0:
+            candidate["rejection_reasons"].append("estimated credit not positive")
+        if abs(candidate["short_delta"]) < 0.15:
+            candidate["rejection_reasons"].append("delta too low")
+        elif abs(candidate["short_delta"]) > 0.20:
+            candidate["rejection_reasons"].append("delta too high")
+
+        candidate["accepted"] = (
+            not candidate["rejection_reasons"]
+            and candidate["estimated_credit"] > 0.0
+            and 0.15 <= abs(candidate["short_delta"]) <= 0.20
         )
 
-    # Rank by: 1) Highest return on risk, 2) Highest estimated credit, 3) Highest probability of profit
-    candidates.sort(
+        candidates.append(candidate)
+
+    return candidates
+
+
+def _build_bull_put_spread_candidates(
+    puts_df: pd.DataFrame,
+    ticker: Optional[str] = None,
+    expiration: Optional[str] = None,
+    current_price: Optional[float] = None,
+) -> List[Dict[str, object]]:
+    return [
+        candidate
+        for candidate in _evaluate_bull_put_spreads(puts_df, ticker=ticker, expiration=expiration, current_price=current_price)
+        if candidate.get("accepted")
+    ]
+
+
+def _rank_bull_put_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    return sorted(
+        [c for c in candidates if c.get("accepted")],
         key=lambda item: (
             -float(item.get("return_on_risk", 0.0)),
             -float(item.get("estimated_credit", 0.0)),
-            -float(item.get("probability_of_profit") or 0.0),
-        )
+        ),
     )
-    return candidates
 
 
-def _build_bear_call_spread_candidates(calls_df: pd.DataFrame) -> List[Dict[str, float]]:
-    if calls_df is None or calls_df.empty:
-        return []
-
-    prepared = calls_df.copy()
-    prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
-    prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
-
-    if prepared.empty:
-        return []
-
-    candidates: List[Dict[str, float]] = []
-    for index, short_row in prepared.iterrows():
-        short_strike = float(short_row["strike"])
-        long_strike = short_strike + 5.0
-        long_row = prepared[prepared["strike"] == long_strike]
-        if long_row.empty:
-            continue
-
-        width = long_strike - short_strike
-        metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
-
-        candidates.append(
-            {
-                "short_strike": round(short_strike, 2),
-                "long_strike": round(long_strike, 2),
-                "width": round(width, 2),
-                "estimated_credit": metrics["estimated_credit"],
-                "max_risk": metrics["max_risk"],
-                "return_on_risk": metrics["return_on_risk"],
-                "short_delta": float(pd.to_numeric(short_row.get("delta"), errors="coerce") or 0.0),
-                "probability_of_profit": metrics["probability_of_profit"],
-            }
+def _closest_failed_candidates(candidates: List[Dict[str, object]], limit: int = 5) -> List[Dict[str, object]]:
+    def failure_distance(candidate: Dict[str, object]) -> tuple:
+        delta = abs(float(candidate.get("short_delta") or 0.0))
+        if delta < 0.15:
+            delta_gap = 0.15 - delta
+        elif delta > 0.20:
+            delta_gap = delta - 0.20
+        else:
+            delta_gap = 0.0
+        credit = float(candidate.get("estimated_credit") or 0.0)
+        credit_gap = 0.0 if credit > 0.0 else abs(credit) + 1.0
+        return (
+            delta_gap,
+            credit_gap,
+            -credit,
         )
 
-    candidates.sort(
-        key=lambda item: (
-            -float(item["return_on_risk"]),
-            -float(item["estimated_credit"]),
-            float(item["short_strike"]),
-        )
-    )
-    return candidates
+    failed_candidates = [c for c in candidates if not c.get("accepted")]
+    return sorted(failed_candidates, key=failure_distance)[:limit]
 
 
 def _normalize_option_chain_payload(chain_data: object) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -412,11 +435,10 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
 
         current_price = _current_price_from_yfinance(ticker)
         try:
-            chain_data = stock.option_chain(selected_expiration)
+            _, puts_df = _normalize_option_chain_payload(stock.option_chain(selected_expiration))
         except Exception:
             raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
 
-        calls_df, puts_df = _normalize_option_chain_payload(chain_data)
         if puts_df is None:
             raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
 
@@ -426,41 +448,30 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
         for c in candidates:
             c["expiration"] = selected_expiration
 
-        # After evaluating the selected expiration, pick the best candidate
-        if strategy == "Bull Put Spread":
-            if not candidates:
-                raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
-            best = candidates[0]
+        ranked = _rank_bull_put_candidates(candidates)
+        if ranked:
+            best = ranked[0]
             return {
                 "ticker": ticker,
                 "strategy": strategy,
                 "expiration": selected_expiration,
                 "short_strike": best["short_strike"],
                 "long_strike": best["long_strike"],
-                "width": best["width"],
+                "width": 5.0,
                 "estimated_credit": best["estimated_credit"],
                 "max_risk": best["max_risk"],
                 "short_delta": best["short_delta"],
-                "probability_of_profit": best["probability_of_profit"],
+                "probability_of_profit": best.get("probability_of_profit"),
                 "return_on_risk": best["return_on_risk"],
             }
 
-        candidates = _build_bear_call_spread_candidates(calls_df)
-        if not candidates:
-            raise ValueError(f"No 5-point bear call spreads available for {ticker}")
-        best = candidates[0]
+        closest_candidates = _closest_failed_candidates(candidates, limit=5)
         return {
             "ticker": ticker,
             "strategy": strategy,
             "expiration": selected_expiration,
-            "short_strike": best["short_strike"],
-            "long_strike": best["long_strike"],
-            "width": best["width"],
-            "estimated_credit": best["estimated_credit"],
-            "max_risk": best["max_risk"],
-            "short_delta": best["short_delta"],
-            "probability_of_profit": best["probability_of_profit"],
-            "return_on_risk": best["return_on_risk"],
+            "message": f"No valid Bull Put Spread candidates available for {ticker}",
+            "closest_candidates": closest_candidates,
         }
     except Exception as exc:
         return {
@@ -476,7 +487,13 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
     The returned dict contains the selected expiration and a list of candidate dicts with
     acceptance status and rejection reasons.
     """
-    result: Dict[str, object] = {"ticker": ticker, "expiration": None, "candidates": []}
+    result: Dict[str, object] = {
+        "ticker": ticker,
+        "expiration": None,
+        "candidates": [],
+        "available_expirations": [],
+        "per_expirations": [],
+    }
     if not ticker:
         return result
 
@@ -487,142 +504,28 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
         if not expirations:
             return result
 
-        # Evaluate each expiration and collect per-expiration diagnostics
-        # determine a selected expiration for quick reference and keep per-expiration details
         selected_expiration = _select_expiration(expirations)
         result["expiration"] = selected_expiration
 
-        per_expirations: List[Dict[str, object]] = []
-        for exp in expirations:
-            exp_entry: Dict[str, object] = {"expiration": exp, "candidates": []}
-            try:
-                chain_data = stock.option_chain(exp)
-            except Exception:
-                exp_entry["error"] = "unable to retrieve option chain"
-                per_expirations.append(exp_entry)
-                continue
+        current_price = _current_price_from_yfinance(ticker)
+        try:
+            _, puts_df = _normalize_option_chain_payload(stock.option_chain(selected_expiration))
+        except Exception:
+            result["per_expirations"] = [{"expiration": selected_expiration, "error": "unable to retrieve option chain", "candidates": []}]
+            return result
 
-            calls_df, puts_df = _normalize_option_chain_payload(chain_data)
-            if puts_df is None or puts_df.empty:
-                exp_entry["error"] = "no puts data for expiration"
-                per_expirations.append(exp_entry)
-                continue
+        if puts_df is None or puts_df.empty:
+            result["per_expirations"] = [{"expiration": selected_expiration, "error": "no puts data for expiration", "candidates": []}]
+            return result
 
-            prepared = puts_df.copy()
-            prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
-            prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
+        candidates = _build_bull_put_spread_candidates(
+            puts_df, ticker=ticker, expiration=selected_expiration, current_price=current_price
+        )
+        for c in candidates:
+            c["expiration"] = selected_expiration
 
-            for index, short_row in prepared.iterrows():
-                short_strike = float(short_row["strike"])
-                long_strike = short_strike - 5.0
-                long_row = prepared[prepared["strike"] == long_strike]
-                width = short_strike - long_strike
-
-                candidate: Dict[str, object] = {
-                    "short_strike": round(short_strike, 2),
-                    "long_strike": round(long_strike, 2) if not long_row.empty else None,
-                    "width": round(width, 2),
-                    "estimated_credit": None,
-                    "estimated_short_delta": None,
-                    "raw_bid": None,
-                    "raw_ask": None,
-                    "mid_price": None,
-                    "raw_delta": None,
-                    "accepted": False,
-                    "rejection_reasons": [],
-                }
-
-                if long_row.empty:
-                    candidate["rejection_reasons"].append("no matching 5-width long strike")
-                    exp_entry["candidates"].append(candidate)
-                    continue
-                metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
-                candidate["estimated_credit"] = metrics.get("estimated_credit")
-                candidate["return_on_risk"] = metrics.get("return_on_risk")
-                candidate["probability_of_profit"] = metrics.get("probability_of_profit")
-
-                # Raw market fields
-                try:
-                    bid_val = pd.to_numeric(short_row.get("bid"), errors="coerce")
-                except Exception:
-                    bid_val = None
-                try:
-                    ask_val = pd.to_numeric(short_row.get("ask"), errors="coerce")
-                except Exception:
-                    ask_val = None
-                candidate["raw_bid"] = float(bid_val) if pd.notna(bid_val) else None
-                candidate["raw_ask"] = float(ask_val) if pd.notna(ask_val) else None
-                try:
-                    candidate["mid_price"] = float(_price_midpoint(short_row))
-                except Exception:
-                    candidate["mid_price"] = None
-                try:
-                    raw_delta_val = pd.to_numeric(short_row.get("delta"), errors="coerce")
-                    candidate["raw_delta"] = float(raw_delta_val) if pd.notna(raw_delta_val) else None
-                except Exception:
-                    candidate["raw_delta"] = None
-
-                if pd.notna(raw_delta_val):
-                    candidate["short_delta"] = float(raw_delta_val)
-                    candidate["estimated_short_delta"] = None
-                else:
-                    cp = _current_price_from_yfinance(ticker) or short_strike
-                    try:
-                        dte = _days_to_expiration(pd.Timestamp(exp))
-                    except Exception:
-                        dte = 45
-
-                    iv_raw = (
-                        short_row.get("impliedVolatility")
-                        or short_row.get("implied_volatility")
-                        or short_row.get("iv")
-                        or short_row.get("ivRank")
-                        or short_row.get("iv_rank")
-                        or 0.0
-                    )
-                    try:
-                        iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
-                    except Exception:
-                        iv_val = 0.0
-
-                    if 0.0 <= iv_val <= 1.0:
-                        implied_vol = 0.2 + iv_val * 0.4
-                    else:
-                        implied_vol = iv_val
-
-                    est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
-                    candidate["estimated_short_delta"] = est_delta
-                    candidate["short_delta"] = float(est_delta)
-
-                # Delta rejection categorization
-                if abs(candidate["short_delta"]) < 0.15:
-                    candidate["rejection_reasons"].append("delta too low")
-                elif abs(candidate["short_delta"]) > 0.20:
-                    candidate["rejection_reasons"].append("delta too high")
-
-                # Estimated credit check
-                credit_val = candidate.get("estimated_credit") or 0.0
-                if credit_val <= 0.0:
-                    candidate["rejection_reasons"].append("insufficient estimated credit")
-                elif credit_val < 0.9:
-                    candidate["rejection_reasons"].append("credit too low")
-
-                # Return-on-risk informational note (not used to reject candidates)
-                ror = candidate.get("return_on_risk") or 0.0
-                if ror < 0.25:
-                    candidate["rejection_reasons"].append("return on risk too low")
-
-                # Acceptance: must have matching long strike and pass delta+credit thresholds
-                # We treat 'return on risk too low' as informational only
-                hard_reasons = [r for r in candidate["rejection_reasons"] if r not in {"return on risk too low"}]
-                if not hard_reasons:
-                    candidate["accepted"] = True
-
-                exp_entry["candidates"].append(candidate)
-
-            per_expirations.append(exp_entry)
-
-        result["per_expirations"] = per_expirations
+        result["candidates"] = candidates
+        result["per_expirations"] = [{"expiration": selected_expiration, "candidates": candidates}]
         return result
     except Exception:
         return result

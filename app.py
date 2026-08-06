@@ -114,25 +114,43 @@ def _render_bull_put_diagnostics(scan_results: pd.DataFrame):
             st.markdown("No candidates found for this ticker.")
             continue
 
+        rows = []
         for c in candidates:
-            short = c.get("short_strike")
-            delta = c.get("short_delta")
-            credit = c.get("estimated_credit")
-            width = c.get("width")
-            accepted = c.get("accepted")
-            reasons = c.get("rejection_reasons") or []
+            rows.append(
+                {
+                    "expiration": c.get("expiration"),
+                    "short_strike": c.get("short_strike"),
+                    "long_strike": c.get("long_strike"),
+                    "short_delta": c.get("short_delta"),
+                    "estimated_credit": c.get("estimated_credit"),
+                    "max_risk": c.get("max_risk"),
+                    "return_on_risk": c.get("return_on_risk"),
+                    "iv_rank": c.get("iv_rank"),
+                    "accepted": c.get("accepted"),
+                    "rejection_reasons": ", ".join(c.get("rejection_reasons") or []),
+                }
+            )
 
-            if accepted:
-                st.markdown(f"- {short}: Accepted")
-            else:
-                if reasons:
-                    reason_text = ", ".join(reasons)
-                else:
-                    reason_text = "Rejected"
-                detail = f"- {short}: Rejected: {reason_text}"
-                if delta is not None:
-                    detail += f" (short delta = {delta:.2f})"
-                st.markdown(detail)
+        if rows:
+            df_all = pd.DataFrame(rows)
+            st.markdown("**All evaluated Bull Put candidates**")
+            st.dataframe(
+                df_all[
+                    [
+                        "expiration",
+                        "short_strike",
+                        "long_strike",
+                        "short_delta",
+                        "estimated_credit",
+                        "max_risk",
+                        "return_on_risk",
+                        "iv_rank",
+                        "accepted",
+                        "rejection_reasons",
+                    ]
+                ],
+                use_container_width=True,
+            )
 
         # If there is a selected expiration, show a detailed debug table for every strike evaluated
         sel_exp = diag.get("expiration")
