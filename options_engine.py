@@ -201,6 +201,52 @@ def _estimate_put_delta(current_price: float, strike: float, implied_vol: Option
     return float(put_delta)
 
 
+def _get_option_short_delta(
+    short_row: pd.Series,
+    ticker: Optional[str] = None,
+    expiration: Optional[str] = None,
+    current_price: Optional[float] = None,
+) -> float:
+    raw_delta = pd.to_numeric(short_row.get("delta"), errors="coerce")
+    if pd.notna(raw_delta):
+        return float(raw_delta)
+
+    cp = current_price
+    if cp is None and ticker:
+        cp = _current_price_from_yfinance(ticker)
+    if cp is None:
+        cp = float(pd.to_numeric(short_row.get("strike"), errors="coerce") or 0.0)
+
+    if expiration:
+        try:
+            dte = _days_to_expiration(pd.Timestamp(expiration))
+        except Exception:
+            dte = 45
+    else:
+        dte = 45
+
+    iv_raw = (
+        short_row.get("impliedVolatility")
+        or short_row.get("implied_volatility")
+        or short_row.get("iv")
+        or short_row.get("ivRank")
+        or short_row.get("iv_rank")
+        or 0.0
+    )
+    try:
+        iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
+    except Exception:
+        iv_val = 0.0
+
+    if 0.0 <= iv_val <= 1.0:
+        implied_vol = 0.2 + iv_val * 0.4
+    else:
+        implied_vol = iv_val
+
+    strike = float(pd.to_numeric(short_row.get("strike"), errors="coerce") or 0.0)
+    return _estimate_put_delta(cp, strike, implied_vol, dte)
+
+
 def _build_bull_put_spread_candidates(
     puts_df: pd.DataFrame,
     ticker: Optional[str] = None,
@@ -227,47 +273,14 @@ def _build_bull_put_spread_candidates(
         width = short_strike - long_strike
         metrics = _build_spread_metrics(short_row, long_row.iloc[0], width)
 
-        # Determine current price and days to expiration for delta estimation
-        cp = current_price
-        if cp is None and ticker:
-            cp = _current_price_from_yfinance(ticker)
-        if cp is None:
-            # Fallback to using short strike as proxy (keeps estimator deterministic)
-            cp = short_strike
-
-        if expiration:
-            try:
-                dte = _days_to_expiration(pd.Timestamp(expiration))
-            except Exception:
-                dte = 45
-        else:
-            dte = 45
-
-        # Get implied vol if present; try multiple keys
-        iv_raw = (
-            short_row.get("impliedVolatility")
-            or short_row.get("implied_volatility")
-            or short_row.get("iv")
-            or short_row.get("ivRank")
-            or short_row.get("iv_rank")
-            or 0.0
+        short_delta = _get_option_short_delta(
+            short_row,
+            ticker=ticker,
+            expiration=expiration,
+            current_price=current_price,
         )
-        try:
-            iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
-        except Exception:
-            iv_val = 0.0
 
-        # If iv_val appears to be IV Rank (0-1) convert roughly to vol by scaling
-        if 0.0 <= iv_val <= 1.0:
-            implied_vol = 0.2 + iv_val * 0.4  # map ivRank 0-1 to vol 20%-60%
-        else:
-            implied_vol = iv_val
-
-        estimated_short_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
-        # store as negative value for puts; selection by absolute value
-
-        # Require estimated short delta in required range
-        if not (0.15 <= abs(estimated_short_delta) <= 0.20):
+        if not (0.15 <= abs(short_delta) <= 0.20):
             continue
 
         # Require minimum estimated credit
@@ -293,7 +306,7 @@ def _build_bull_put_spread_candidates(
                 "estimated_credit": metrics["estimated_credit"],
                 "max_risk": metrics["max_risk"],
                 "return_on_risk": metrics["return_on_risk"],
-                "short_delta": float(estimated_short_delta),
+                "short_delta": float(short_delta),
                 "probability_of_profit": metrics["probability_of_profit"],
                 "iv_rank": iv_rank_value,
             }
@@ -393,42 +406,35 @@ def build_trade(ticker: str, strategy: str) -> Dict[str, object]:
         if not expirations:
             raise ValueError(f"No option expirations available for {ticker}")
 
-        # Evaluate all expirations and collect candidates across them
-        all_candidates: List[Dict[str, object]] = []
+        selected_expiration = _select_expiration(expirations)
+        if not selected_expiration:
+            raise ValueError(f"No valid option expiration selected for {ticker}")
+
         current_price = _current_price_from_yfinance(ticker)
-        for exp in expirations:
-            try:
-                chain_data = stock.option_chain(exp)
-            except Exception:
-                continue
-            calls_df, puts_df = _normalize_option_chain_payload(chain_data)
-            if puts_df is None or puts_df is None:
-                continue
+        try:
+            chain_data = stock.option_chain(selected_expiration)
+        except Exception:
+            raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
 
-            candidates = _build_bull_put_spread_candidates(
-                puts_df, ticker=ticker, expiration=exp, current_price=current_price
-            )
-            for c in candidates:
-                c["expiration"] = exp
-            all_candidates.extend(candidates)
+        calls_df, puts_df = _normalize_option_chain_payload(chain_data)
+        if puts_df is None:
+            raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
 
-        # After evaluating all expirations, apply final ranking and pick best
+        candidates = _build_bull_put_spread_candidates(
+            puts_df, ticker=ticker, expiration=selected_expiration, current_price=current_price
+        )
+        for c in candidates:
+            c["expiration"] = selected_expiration
+
+        # After evaluating the selected expiration, pick the best candidate
         if strategy == "Bull Put Spread":
-            if not all_candidates:
+            if not candidates:
                 raise ValueError(f"No valid Bull Put Spread candidates available for {ticker}")
-            # Already sorted within each call; sort final list by required ranking
-            all_candidates.sort(
-                key=lambda item: (
-                    -float(item.get("return_on_risk", 0.0)),
-                    -float(item.get("estimated_credit", 0.0)),
-                    -float(item.get("probability_of_profit") or 0.0),
-                )
-            )
-            best = all_candidates[0]
+            best = candidates[0]
             return {
                 "ticker": ticker,
                 "strategy": strategy,
-                "expiration": best.get("expiration"),
+                "expiration": selected_expiration,
                 "short_strike": best["short_strike"],
                 "long_strike": best["long_strike"],
                 "width": best["width"],
@@ -556,37 +562,42 @@ def diagnose_bull_put_candidates(ticker: str) -> Dict[str, object]:
                 except Exception:
                     candidate["raw_delta"] = None
 
-                # Estimate short delta using current price, implied vol and DTE
-                cp = _current_price_from_yfinance(ticker) or short_strike
-                try:
-                    dte = _days_to_expiration(pd.Timestamp(exp))
-                except Exception:
-                    dte = 45
-
-                iv_raw = (
-                    short_row.get("impliedVolatility")
-                    or short_row.get("implied_volatility")
-                    or short_row.get("iv")
-                    or short_row.get("ivRank")
-                    or short_row.get("iv_rank")
-                    or 0.0
-                )
-                try:
-                    iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
-                except Exception:
-                    iv_val = 0.0
-
-                if 0.0 <= iv_val <= 1.0:
-                    implied_vol = 0.2 + iv_val * 0.4
+                if pd.notna(raw_delta_val):
+                    candidate["short_delta"] = float(raw_delta_val)
+                    candidate["estimated_short_delta"] = None
                 else:
-                    implied_vol = iv_val
+                    cp = _current_price_from_yfinance(ticker) or short_strike
+                    try:
+                        dte = _days_to_expiration(pd.Timestamp(exp))
+                    except Exception:
+                        dte = 45
 
-                est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
-                candidate["estimated_short_delta"] = est_delta
+                    iv_raw = (
+                        short_row.get("impliedVolatility")
+                        or short_row.get("implied_volatility")
+                        or short_row.get("iv")
+                        or short_row.get("ivRank")
+                        or short_row.get("iv_rank")
+                        or 0.0
+                    )
+                    try:
+                        iv_val = float(pd.to_numeric(iv_raw, errors="coerce") or 0.0)
+                    except Exception:
+                        iv_val = 0.0
+
+                    if 0.0 <= iv_val <= 1.0:
+                        implied_vol = 0.2 + iv_val * 0.4
+                    else:
+                        implied_vol = iv_val
+
+                    est_delta = _estimate_put_delta(cp, short_strike, implied_vol, dte)
+                    candidate["estimated_short_delta"] = est_delta
+                    candidate["short_delta"] = float(est_delta)
+
                 # Delta rejection categorization
-                if abs(est_delta) < 0.15:
+                if abs(candidate["short_delta"]) < 0.15:
                     candidate["rejection_reasons"].append("delta too low")
-                elif abs(est_delta) > 0.20:
+                elif abs(candidate["short_delta"]) > 0.20:
                     candidate["rejection_reasons"].append("delta too high")
 
                 # Estimated credit check
