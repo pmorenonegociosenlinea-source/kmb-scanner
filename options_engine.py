@@ -258,42 +258,41 @@ def _evaluate_bull_put_spreads(
 
     prepared = puts_df.copy()
     prepared["strike"] = pd.to_numeric(prepared.get("strike"), errors="coerce")
-    prepared = prepared.dropna(subset=["strike"]).sort_values(by=["strike"], ascending=True)
+    prepared = prepared.dropna(subset=["strike"])
     if prepared.empty:
         return []
 
+    prepared = prepared.drop_duplicates(subset=["strike"], keep="first").sort_values(by=["strike"], ascending=False)
+    if prepared.empty:
+        return []
+
+    if current_price is None and ticker:
+        current_price = _current_price_from_yfinance(ticker)
+
+    width = 5.0
     candidates: List[Dict[str, object]] = []
-    for _, short_row in prepared.iterrows():
-        short_strike = float(short_row["strike"])
-        long_strike = round(short_strike - 5.0, 2)
-        long_rows = prepared[prepared["strike"] == long_strike]
+    strike_map = {float(row["strike"]): row for _, row in prepared.iterrows()}
 
-        short_bid = pd.to_numeric(short_row.get("bid"), errors="coerce")
-        long_ask = pd.to_numeric(long_rows.iloc[0].get("ask"), errors="coerce") if not long_rows.empty else None
-        long_delta = None
-        if not long_rows.empty:
-            try:
-                long_delta_val = pd.to_numeric(long_rows.iloc[0].get("delta"), errors="coerce")
-                long_delta = float(long_delta_val) if pd.notna(long_delta_val) else None
-            except Exception:
-                long_delta = None
+    for short_strike in sorted(strike_map.keys(), reverse=True):
+        long_strike = round(short_strike - width, 2)
+        if long_strike not in strike_map:
+            continue
 
-        iv_rank_raw = (
-            short_row.get("ivRank")
-            or short_row.get("iv_rank")
-            or 0.0
-        )
-        try:
-            iv_rank_val = float(pd.to_numeric(iv_rank_raw, errors="coerce") or 0.0)
-        except Exception:
-            iv_rank_val = 0.0
+        short_row = strike_map[short_strike]
+        long_row = strike_map[long_strike]
 
-        estimated_credit = 0.0
-        if pd.notna(short_bid) and pd.notna(long_ask):
-            estimated_credit = float(short_bid - long_ask)
+        raw_bid = pd.to_numeric(short_row.get("bid"), errors="coerce")
+        raw_ask = pd.to_numeric(long_row.get("ask"), errors="coerce")
 
-        max_risk = 5.0 - estimated_credit
-        return_on_risk = float(estimated_credit / max_risk) if max_risk > 0.0 else 0.0
+        if not pd.notna(raw_bid) or raw_bid <= 0.0:
+            raw_bid = pd.to_numeric(short_row.get("lastPrice"), errors="coerce")
+        if not pd.notna(raw_ask) or raw_ask <= 0.0:
+            raw_ask = pd.to_numeric(long_row.get("lastPrice"), errors="coerce")
+
+        if not pd.notna(raw_bid):
+            raw_bid = 0.0
+        if not pd.notna(raw_ask):
+            raw_ask = 0.0
 
         raw_delta_val = pd.to_numeric(short_row.get("delta"), errors="coerce")
         if pd.notna(raw_delta_val):
@@ -308,27 +307,53 @@ def _evaluate_bull_put_spreads(
             )
             estimated_short_delta = float(short_delta)
 
+        estimated_credit = float(raw_bid - raw_ask)
+        max_risk = max(width - estimated_credit, 0.0)
+        return_on_risk = float(estimated_credit / max_risk) if max_risk > 0.0 else 0.0
+
+        iv_rank_raw = (
+            short_row.get("ivRank")
+            or short_row.get("iv_rank")
+            or short_row.get("iv")
+            or short_row.get("impliedVolatility")
+            or 0.0
+        )
+        try:
+            iv_rank_val = float(pd.to_numeric(iv_rank_raw, errors="coerce") or 0.0)
+        except Exception:
+            iv_rank_val = 0.0
+
         candidate: Dict[str, object] = {
             "expiration": expiration,
             "short_strike": round(short_strike, 2),
-            "long_strike": long_strike if not long_rows.empty else None,
-            "short_bid": float(short_bid) if pd.notna(short_bid) else None,
-            "long_ask": float(long_ask) if pd.notna(long_ask) else None,
+            "long_strike": long_strike,
+            "raw_bid": float(raw_bid),
+            "raw_ask": float(raw_ask),
+            "mid_price": _price_midpoint(short_row),
+            "raw_delta": float(raw_delta_val) if pd.notna(raw_delta_val) else None,
+            "short_bid": float(raw_bid) if raw_bid > 0.0 else None,
+            "long_ask": float(raw_ask) if raw_ask > 0.0 else None,
             "estimated_credit": round(estimated_credit, 2),
             "max_risk": round(max_risk, 2),
             "return_on_risk": return_on_risk,
             "short_delta": float(short_delta),
             "estimated_short_delta": estimated_short_delta,
-            "long_delta": long_delta,
             "iv_rank": iv_rank_val,
             "accepted": False,
             "rejection_reasons": [],
         }
 
-        if long_rows.empty:
-            candidate["rejection_reasons"].append("no matching 5-width long strike")
-        if candidate["short_bid"] is None or candidate["long_ask"] is None:
-            candidate["rejection_reasons"].append("missing short bid or long ask")
+        print(
+            f"GENERATED SPREAD: expiration={expiration} short={candidate['short_strike']} "
+            f"long={candidate['long_strike']} short_delta={candidate['short_delta']} "
+            f"credit={candidate['estimated_credit']} max_risk={candidate['max_risk']} "
+            f"ror={candidate['return_on_risk']} iv_rank={candidate['iv_rank']}"
+        )
+
+        if raw_bid <= 0.0:
+            candidate["rejection_reasons"].append("missing or non-positive short bid")
+        if raw_ask <= 0.0:
+            candidate["rejection_reasons"].append("missing or non-positive long ask")
         if candidate["estimated_credit"] <= 0.0:
             candidate["rejection_reasons"].append("estimated credit not positive")
         if abs(candidate["short_delta"]) < 0.15:
@@ -341,6 +366,12 @@ def _evaluate_bull_put_spreads(
             and candidate["estimated_credit"] > 0.0
             and 0.15 <= abs(candidate["short_delta"]) <= 0.20
         )
+
+        if candidate["accepted"]:
+            print("PASSED")
+        else:
+            print("REJECTED")
+            print("Rejection reasons:", "; ".join(candidate["rejection_reasons"]))
 
         candidates.append(candidate)
 
